@@ -1,5 +1,4 @@
-# bikeNe
-- ghbourhoodEquity
+# bikeNeghbourhoodEquity
 Geospatial analysis of bike share data across Toronto Neighbourhoods
 
 Key Features in Project
