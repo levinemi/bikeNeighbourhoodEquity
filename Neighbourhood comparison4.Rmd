@@ -1,0 +1,466 @@
+---
+title: "Neighbourhood & Equity Analysis"
+author: "levinemi"
+date: "11/11/2020"
+output: 
+  html_document:
+    keep_md: true
+---
+# Toronto Bike Share Access by Neighbourhood
+
+When Toronto’s bike share program was introduced in 2011, it was concentrated in the downtown core [1](https://www.blogto.com/city/2011/05/bixi_bike-sharing_officially_launches_in_toronto/). The system’s first major expansion, which started  in 2015, focused on placing bikes near transit stations [2](https://www.thestar.com/news/gta/transportation/2015/07/06/bike-share-toronto-to-double-with-49-million-from-metrolinx.html ). The system has continued to grow in both size and popularity over the last 5 years [3](https://bikesharetoronto.com/news/2019-milestones/). 
+
+In July 2019, Toronto City Council cemented the Bike Share program's role in the city’s transit infrastructure through the Cycling Network Plan [4](https://www.toronto.ca/services-payments/streets-parking-transportation/cycling-in-toronto/cycle-track-projects/cycling-network-10-year-plan/ ). Council directed transportation services to “work with Bike Share Toronto to develop a co-ordinated plan to install Bike Share infrastructure across Toronto” [5](http://app.toronto.ca/tmmis/viewAgendaItemHistory.do?item=2019.IE6.11).
+
+This is a spatial analysis of Toronto’s bike share system to help inform where and how the Bike Share system should grow to best serve Torontonians? I explore how the system has changed between 2017 and 2020. How access varies by neighbourhood. And whether there is a relationship between proximity to this service and the social and economic characteristics of a neighbourhood.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, tidy.opts=list(width.cutoff=60),tidy=TRUE)
+```
+
+```{r Loading Libraries, warning=FALSE}
+library(data.table)
+library(lubridate) #date fields
+library(RColorBrewer)#graph colors
+library(ggmap)#spatial visualization and online map resources
+library(sf)#simple features for geospatial plots
+library(mapview)#interactive spatial visualizations
+library(tmap)#interactive maps and open source map layers
+library(summarytools)#easy and clean crosstabs 
+library(PMCMR) #post-hoc comparisons
+library(tidyverse)#includes ggplot2, dplyr, tidyr, purrr, stringr, etc.
+```
+
+## Data
+
+The data for this project is available from the [Toronto Open Data Catalogue.](https://open.toronto.ca/)
+
+I created a comprehensive list of Bike Share stations and their locations from two sources. The data for Bike Share Ridership includes the starting and ending station for each bike share trip over the course of the year. Usually it's used to understand usage patterns and volume. I used it to identify all the stations in the city for 2017, 2018 and 2019.  At the time of analysis, there is a full year of ridership data for each of those years.  The second source was the live feed of Bike Share system status.  Bike Share Toronto makes current system information available via API. I accessed the live feed on November 4, 2020 to create the list of bike share stations in 2020.  
+
+Information about neighbourhoods and their characteristics was drawn from the [City of Toronto Neighbourhood Profiles](https://www.toronto.ca/city-government/data-research-maps/neighbourhoods-communities/neighbourhood-profiles/). The City developed a set of 140 neighbourhoods to help with local planning and research. The profiles include information from the census about population, education, identity and income. Information for each census tract in a neighbourhood is added together to generate the neighbourhood profile. The neighbourhood boundaries are constant, which allows for comparisons over time. For example, in the current analysis I explore how Bike Share station distribution varies across neighbourhoods over time. 
+
+```{r Load Data}
+# Load objects required from the 'LoadandCleanData.Rmd' script for ridership, station and neighbourhood data. See  https://github.com/levinemi/bikeshare_dataprep for the complete load.
+setwd("~/bikeNeighbourEquity/Data/")
+neigh_raw <- readRDS("neigh_raw.rds")
+neigh_shp <- readRDS("neigh_shp.rds")
+ride_geo <- readRDS("ride_geo.rds")
+stations <- readRDS("stations.rds")
+```
+```{r Create point data object for station location by year}
+#List of stations and their lat/lon by year 
+temp1 <- rbind(ride_geo %>% 
+                 mutate(year = year(trip_start_time)) %>% 
+                 select(from_station_id,
+                        from_station_name,
+                        from_lat,
+                        from_lon,
+                        year) %>%
+                 distinct() %>%
+                rename(station_id = from_station_id, 
+                        name=from_station_name, 
+                        lat=from_lat, 
+                        lon=from_lon),
+               stations %>% 
+                 select(station_id, name, lat, lon) %>% 
+                 mutate(year = 2020)) %>%  
+  arrange(station_id, year) 
+#%>% filter(duplicated(station_id)) 
+
+
+# Include stations one time (by the first year that they appear).
+temp1 <- temp1[duplicated(temp1$station_id, incomparables = NA)==F,]
+
+stations_by_year_sf <- st_as_sf(temp1,
+                                coords = c("lon", "lat"),
+                                crs=4326) # the EPSG identifier for WGS84 projection)
+
+stations_by_year_sf$year <- as.factor(stations_by_year_sf$year)
+
+#remove temp objects
+rm(temp1)
+```
+
+```{r Map Mode}
+tmap_mode("plot") #sets the system to interactive viewing mode
+```
+
+I started by mapping station locations and the borders of each neighbourhoods. The different colored dots indicate the year that the station was introduced to the system. Stations that have since been removed or moved are included in the analysis. At a glance you can see that the system is growing outwards overtime, but the majority of stations are in the downtown core.  There are also many neighbourhoods from the middle to the outer edges of the city that have no stations.
+
+```{r}
+tm_basemap("OpenStreetMap.Mapnik", alpha = 0.5)+
+  tm_shape(neigh_shp)+
+  tm_borders()+
+  tm_shape(stations_by_year_sf)+
+   tm_dots(col="year", palette = "PuBuGn", alpha=0.8, jitter=0.2)+
+  tm_layout(title = "Station location by year and neighbourhood")
+```
+
+## Descriptive statistics
+
+The table below shows the total number of stations in each of the years of analysis. It also shows the smallest and largest number of stations per neighbourhood each year. The smallest number of stations is consistent over time, but the largest number of stations increased from 38 to 62. The number of neighbourhoods with no stations decreased over the last 4 years. In 2017, 70% of neighbourhoods had no Bike Share stations and in 2020, just under half of neighbourhoods were without a station. 
+
+```{r Number of stations by Neighbourhood, warning=FALSE, error=FALSE}
+stations_by_neigh <- st_join(stations_by_year_sf, neigh_shp, join=st_within) #Find which neighbourhood each station is in
+
+#Number of stations per neighbourhood per year
+station_count_2017 <- count(as_tibble(stations_by_neigh %>% filter(year==2017)), AREA_LONG_CODE) %>%
+  rename(count = n)
+station_count_2018 <- count(as_tibble(stations_by_neigh %>% filter(year==2017|year==2018)), AREA_LONG_CODE) %>% 
+  rename(count = n) 
+station_count_2019 <- count(as_tibble(stations_by_neigh %>% filter(year==2017|year==2018|year==2019)), AREA_LONG_CODE) %>% rename(count = n)
+station_count_2020 <- count(as_tibble(stations_by_neigh), AREA_LONG_CODE) %>% 
+  rename(count = n)
+
+#Add the count of stations to the neighbourhood polygons
+neigh_counts <- left_join(neigh_shp, station_count_2017, by = "AREA_LONG_CODE") %>%
+  mutate(year=2017) 
+neigh_counts <- rbind(neigh_counts, 
+                      left_join(neigh_shp, station_count_2018, by = "AREA_LONG_CODE") %>%
+  mutate(year=2018))
+neigh_counts <- rbind(neigh_counts, 
+                      left_join(neigh_shp, station_count_2019, by = "AREA_LONG_CODE") %>%
+  mutate(year=2019))
+neigh_counts <- rbind(neigh_counts, 
+                      left_join(neigh_shp, station_count_2020, by = "AREA_LONG_CODE")  %>% mutate(year=2020))
+
+full_join(neigh_counts %>% group_by(year) %>% 
+  summarise(sum(count, na.rm = T), 
+            min(count, na.rm = T),
+            max(count, na.rm = T), .groups = 'drop') %>% 
+  rename(Year=year, 
+         TotalStations='sum(count, na.rm = T)', 
+         SmallestNum ='min(count, na.rm = T)', 
+         LargestNum ='max(count, na.rm = T)') %>%
+  st_drop_geometry(), 
+  neigh_counts %>% group_by(year) %>% 
+  filter(is.na(count))%>% 
+  count() %>% 
+  rename(Year=year, NoStations=n) %>%
+  st_drop_geometry(), by="Year")
+
+#remove temp objects
+rm(station_count_2017, station_count_2018, station_count_2019, station_count_2020)
+```
+```{r, eval=FALSE}
+#count_by_year 
+temp1 <- neigh_counts %>% 
+  select(AREA_NAME,count, year) %>% 
+  arrange(year, -count) %>% 
+  st_drop_geometry() 
+
+#Neighbourhoods with the most stations
+head(temp1 %>% arrange(year, -count) %>% pivot_wider(names_from = year, values_from=count),10)
+#Neighbourhoods with fewest stations
+head(temp1  %>% arrange(year, count) %>% pivot_wider(names_from = year, values_from=count), 10)
+
+#The number and portion of neighbourhoods with no stations by year
+temp1 %>% 
+  group_by(year) %>% 
+  summarytools::freq(is.na(count)) 
+
+#percent change
+temp1 %>% 
+  arrange(AREA_NAME, year, -count) %>% 
+  group_by(AREA_NAME) %>% 
+  mutate(Change = count - lag(count, 1), 
+         Percent_Change = Change/lag(count, 1)*100) %>%
+  arrange(-Percent_Change)
+
+temp2 <- temp1 %>% arrange(year, -count) %>% pivot_wider(names_from = year, values_from=count) %>% mutate(av_grRate = ((`2020`/`2017`)^(1/4)-1)*100) %>%
+  filter(is.na(av_grRate)==F) %>% 
+  arrange(-av_grRate)
+
+temp2
+
+#remove temporary object
+rm(temp1)
+
+```
+
+The maps below show the number of stations per neighbour from 2017 (top, left) through 2020 (bottom, right). The number of neighbourhoods with a station increased each year. As did the concentration of stations, particularly in the downtown core. In general the system seems to be growing outwards from the Waterfront Communities and Bay Street Corridor neighbourhoods. In 2020, stations were added in the suburbs that are not connected to the rest of the system. One set of stations is near York University in the York University Heights neighbourhood. The second set of stations is spread across 5 neighbourhoods in Scarborough and is positioned near a GO commuter rail station and the Highland Creek trail. 
+
+```{r}
+tm_basemap("OpenStreetMap.Mapnik", alpha = 0.5)+
+  tm_shape(neigh_counts)+
+    tm_fill(col="count", palette = "PuBuGn", legend.is.portrait = T)+
+  tm_facets(by="year", sync = T)+
+  tm_layout(
+    main.title = "Number of Stations by Neighbourhood", 
+    main.title.position = "center")
+```
+
+## Access
+Some Toronto neighbourhoods can be quite big, for example the Rouge and West Humber-Claireville neighbourhoods are both more than 30km^2^. While some communities can be quite small. North St. James Town, Regent Park, Playter Estates-Danforth and Blake-Jones are all less than 1 km^2^. So depending on where in the city you live, having a bike share station in your neighbourhood, doesn’t mean that it’s easy to access. 
+
+For transportation purposes, walking distance is typically considered to be about 400m or a 5-minute walk [6](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3377942/). To approximate 400m of walking distance, I created a 400m circular buffer around each of the current bike share stations.  
+
+With the addition of the buffer, Bike Share stations become “accessible” to even more neighbourhoods. In 2020, 71 neighbourhoods had a station, but 84 neighbourhoods were within walking distance of a station. Sometimes this occurs because of where the stations are placed. In the example below, you can see the station located at Scarlett Road and Eglinton Avenue West is near the border of four neighbourhoods. The walking distance buffer extends out and overlaps 4 neighbourhoods: Humber Heights-Westmount (where the station is located), Rockcliffe-Smythe, Edenbridge-Humber Valley, and Mount Dennis. 
+
+
+```{r}
+#Find the buffer of 400m (The pedestrian shed) around each station location 
+#convert the crs for the stations object to one in meters (https://epsg.io/7801)
+stations_meters <- st_transform(stations_by_year_sf, crs = 7801)
+#create a buffer around the stations
+stations_buff_m <- st_buffer(stations_meters, dist = 400)
+#convert the stations buffer object from EPSG 7801(meter) to EPSG4326(degree)
+stations_buff <- st_transform(stations_buff_m, crs = 4326)
+```
+
+```{r}
+#maps of the the 400m buffer (pedestrian shed) around each station
+tm_basemap("OpenStreetMap.Mapnik", alpha = 0.5)+
+  tm_shape(neigh_shp)+
+    tm_borders(lwd=2)+
+  tm_shape(stations_buff %>% filter(station_id==7583))+
+    tm_polygons(col="#3791C0",alpha=0.8)+
+  tm_shape(stations_by_year_sf %>% filter(station_id==7583))+
+    tm_dots()+
+  tm_view(bbox = c(xmin = -79.58, ymin = 43.66,  xmax= -79.45, ymax = 43.69))
+```
+
+Of course not all the parts of each neighbourhood is within walking distance to a station. The Scarlett Road and Eglinton Avenue station is a good example of that. Only a small portion of each of the 4 adjacent neighbourhoods are within walking distance of the station. In contrast, the buffers for stations in the downtown core tend to overlap such that the neighbourhoods have full coverage. 
+
+```{r}
+#maps of the the 400m buffer (pedestrian shed) around each station
+tm_basemap("OpenStreetMap.Mapnik", alpha = 0.5)+
+  tm_shape(neigh_shp)+
+    tm_borders(lwd=2)+
+  tm_shape(stations_buff)+
+    tm_polygons(col="#3791C0",alpha=0.8)+
+  tm_shape(stations_by_year_sf)+
+    tm_dots()+
+  tm_view(bbox = c(xmin = -79.60, ymin = 43.61,  xmax= -79.19, ymax = 43.84))
+
+```
+
+I defined the coverage of a neighbourhood as the area in a neighbourhood covered by a Bike Station buffer divided by the total area of that neighbourhood. There are 11 neighbourhoods that currently have full coverage. In the 10 neighbourhoods with the least coverage between 0 to 4% of the neighbourhood area is within walking distance of a Bike Share station.  And as of 2020, 40% of the neighbourhoods in Toronto have no coverage at all. 
+
+```{r, error=FALSE}
+#create a function to calculate the amount of a neighbourhood covered by pedestrian sheds (aka buffers).
+#Since the buffers around stations overlap, the set of stations that overlap with each neighbourhood need to be combined into a single object before calculating the coverage area. This prevents double counting of the overlapping pedestrian sheds.
+
+bike_coverage <- function(neighbourhoodObj, bufferObj){
+  #create an temp sf object and calculate the area for each neighbourhood. 
+  temp_neigh_shp <- mutate(neighbourhoodObj, neigh_area = st_area(neighbourhoodObj)) %>% add_column(intersect_area=0)
+  #create a matrix that lists which buffer zones touch each neighbourhood 
+  neighBuff_sgbp <- st_intersects(neighbourhoodObj, bufferObj)
+  for(i in 1:nrow(temp_neigh_shp)){
+    buff_index <- neighBuff_sgbp[[i]] #Create an index of the stations_buff object
+    buff_combo <- bufferObj[buff_index,] %>% summarise(geometry = st_union(geometry)) #Combined the buffers
+    #For each neigh_shp[i,] object:
+    if(length(buff_index)>0){
+      # Calculate the coverage area
+      intersect_pct <- st_intersection(temp_neigh_shp[i,], buff_combo) %>% 
+        mutate(intersect_area = st_area(.)) %>%   
+        select(AREA_LONG_CODE, intersect_area) %>%   # only select columns needed to merge
+        st_drop_geometry()  #drop geometry
+      #Replace the coverage area calculated for each neighbourhood 
+      temp_neigh_shp[i,"intersect_area"] <- as.numeric(intersect_pct$intersect_area)
+    }
+  }
+  #Neighbourhoods with 0 for intersect_area do not have bike share stations within walking distance
+  temp_neigh_shp[temp_neigh_shp$intersect_area==0,"intersect_area"]<- NA
+  #Calculate the bike access coverage (intersect area/neigh_area)
+  temp_neigh_shp <- temp_neigh_shp %>% mutate(coverage = as.numeric(intersect_area/neigh_area))
+  return(temp_neigh_shp)
+}
+
+neigh_coverage_2020 <- bike_coverage(st_transform(neigh_shp, crs = 7801), st_transform(stations_buff, crs = 7801)) %>% arrange(-coverage)
+
+neigh_compare_2020 <- rbind(neigh_coverage_2020 %>% 
+                         slice_max(coverage, n=5) %>% 
+                         select(AREA_LONG_CODE, AREA_NAME, coverage) %>% 
+                         mutate(access="most"),
+                       neigh_coverage_2020 %>% 
+                         slice_min(coverage, n=10) %>% 
+                         select(AREA_LONG_CODE, AREA_NAME, coverage) %>% 
+                         mutate(access="least"),
+                       neigh_coverage_2020 %>% 
+                         filter(is.na(coverage)==T) %>% 
+                         select(AREA_LONG_CODE, AREA_NAME, coverage) %>% 
+                         mutate(access="none")) %>% 
+  mutate(coverage = round(coverage,3)*100)
+```
+
+## Equity
+
+The final section of the analysis compares the characteristics of neighbourhoods with the most, least and no coverage. Analysis from other cities has shown that bike share stations are often placed in neighbourhoods that already have socio-economic advantages [7,](https://www.uvm.edu/sites/default/files/media/TRC_Report_15-011.pdf) [8](https://www.urban.org/urban-wire/three-ways-bikeshare-can-counteract-not-reinforce-dcs-disparities). This may be an artifact of the demand analyses that are often used to assess the feasibility of introducing a Bike Share sytem.  When Bike Share stations are first introduced, they are often located in densely populated areas that are close to existing transit infrastructure or tourist attractions[9](https://www.researchgate.net/publication/241809163_Defining_a_Primary_Market_and_Estimating_Demand_for_Major_Bicycle-Sharing_Program_in_Philadelphia_Pennsylvania). The location of Toronto’s first stations and the initial expansion align with that approach. Assessing the characteristics of neighbourhoods with and without access to the current system, helps identify who the system is currently serving and gaps that could be filled in the future.
+
+Julia Ursaki and Lisa Aultman-Hall compared areas inside and outside Bike Share service areas in six US cities.  They found that the areas differed significantly in race, income and education [7](https://www.uvm.edu/sites/default/files/media/TRC_Report_15-011.pdf).  To test whether there are similar social and economic differences in Toronto, I selected data from the Canadian census about identity, income and education. Some of these characteristics are known to influence bicycle use (e.g. population density, age)  [10](https://www.torontocycling.org/uploads/1/3/1/3/13138411/mapping_cycling_behaviour_in_toronto_final_23_may_printer_tl.pdf). Some factors are proxy measures for community advantage (e.g.,high income, post-secondary education) or disadvantage (e.g. visible minority, High School Diploma, Low Income Cut-Offs (LICO) and Low Income Measure (LIM)). 
+
+I included two different measures of poverty in my analysis for comparative validity. The Low-Income Cut-Off (LICO) is an income cut-off below which families devote more of their income on necessities than the average family. But the cutoff was set in 1992 and may not be a good estimate of the cost or nature of today's ‘necessities’. The Low Income Measure is an income cut-off based on 50% of the income of a median household of the same number of persons. LIM is more current as it's based on the most recent census. But it's a more stringent definition of poverty that doesn't account for the different costs of living across the country.
+
+I compared neighbourhoods on the following characteristics from Toronto’s Neighbourhood Census Profiles:
+
+- Population density
+- Percent visible minority population
+- Percent over age 65
+- Percent working age (25-55)
+- Percent with up to a High School Diploma or Equivalency
+- Percent with Post-Secondary Education
+- Prevalence of Low Income (LICO)
+- Prevalence of Low Income (LIM)
+- Percent of households with income > $100,000
+- Percent of households with income > $200,000
+
+
+```{r}
+#dataprep
+temp1 <- (t(neigh_raw %>% filter(Characteristic=="Neighbourhood Number"|
+                                   Topic=="Population and dwellings"|
+                                   Topic=="Visible minority population"|
+                                   Topic=="Age characteristics"|
+                                   Topic=="Highest certificate, diploma or degree"|
+                                   Topic=="Income of households in 2015"|
+                                   Topic=="Low income in 2015")))
+##set column names
+names <- as.character(temp1[5,]) %>% 
+  paste0("x",.) %>% 
+  str_replace_all(" ","") %>% 
+  str_replace_all("-","_") %>% 
+  str_replace_all("%","") %>% 
+  str_replace_all("\\(","") %>% 
+  str_replace_all("\\)","") %>% 
+  str_replace_all("\\,","") %>% 
+  str_replace_all("\\$","") %>% 
+  str_replace_all("\\+","")
+
+colnames(temp1) <- names
+
+#remove extra columns and rows and correct data types
+temp1 <- temp1[7:nrow(temp1),]
+temp1 <- data.frame(temp1) %>% select(xNeighbourhoodNumber,
+                          xPopulation2016,
+                          xPopulationdensitypersquarekilometre,
+                          xTotalvisibleminoritypopulation,
+                          xNotavisibleminority,
+                          xChildren0_14years,
+                          xYouth15_24years,
+                          xWorkingAge25_54years,
+                          xPre_retirement55_64years,
+                          xSeniors65years,
+                          xOlderSeniors85years,
+                          xTotal_Highestcertificatediplomaordegreeforthepopulationaged15yearsandoverinprivatehouseholds_25sampledata,
+                          xNocertificatediplomaordegree,
+                          xSecondaryhighschooldiplomaorequivalencycertificate,
+                          xPostsecondarycertificatediplomaordegree,
+                          xTotal_Householdtotalincomegroupsin2015forprivatehouseholds_100data,
+                          x100000andover,
+                          x200000andover, 
+                          xPrevalenceoflowincomebasedontheLow_incomecut_offsaftertaxLICO_AT,
+                          xPrevalenceoflowincomebasedontheLow_incomemeasureaftertaxLIM_AT)
+
+temp1 <- cbind(data.frame(xNeighbourhoodNumber = temp1[,1]) %>% 
+                 mutate(xNeighbourhoodNumber = str_pad(xNeighbourhoodNumber,3,side="left",pad="0")),
+               data.frame(apply(temp1[,2:ncol(temp1)], 2, function(x) as.numeric(gsub(",", "", x)))))
+#create metrics
+
+temp1 <- temp1 %>% 
+  mutate(per_visMin = round((xTotalvisibleminoritypopulation/(xTotalvisibleminoritypopulation+xNotavisibleminority)*100),1)) %>% 
+  mutate(total_age = xChildren0_14years+xYouth15_24years+xWorkingAge25_54years+xPre_retirement55_64years+xSeniors65years+xOlderSeniors85years) %>% 
+  mutate(per_over65 = round((((xSeniors65years+xOlderSeniors85years)/total_age)*100),1)) %>% 
+  mutate(per_workAge = round(((xWorkingAge25_54years/total_age)*100),1)) %>% 
+  mutate(per_HSorLess = round((((xNocertificatediplomaordegree+xSecondaryhighschooldiplomaorequivalencycertificate)/xTotal_Highestcertificatediplomaordegreeforthepopulationaged15yearsandoverinprivatehouseholds_25sampledata)*100),1)) %>% 
+  mutate(per_postSec = round(((xPostsecondarycertificatediplomaordegree/xTotal_Highestcertificatediplomaordegreeforthepopulationaged15yearsandoverinprivatehouseholds_25sampledata)*100),1)) %>% 
+  mutate(per_over100 = round(((x100000andover/xTotal_Householdtotalincomegroupsin2015forprivatehouseholds_100data)*100),1))%>% 
+  mutate(per_over200 = round(((x200000andover/xTotal_Householdtotalincomegroupsin2015forprivatehouseholds_100data)*100),1)) %>% rename(pop_density=xPopulationdensitypersquarekilometre,
+            prev_LICO=xPrevalenceoflowincomebasedontheLow_incomecut_offsaftertaxLICO_AT,
+            prev_LIM=xPrevalenceoflowincomebasedontheLow_incomemeasureaftertaxLIM_AT) 
+
+neigh_metrics <- temp1[,c(1,2,3,19:21,23:28)]
+#remove temp objects
+rm(temp1,names)
+```
+
+```{r}
+#Add the metric to the shapefile dataframe
+neigh_compare_2020 <- left_join(neigh_compare_2020, neigh_metrics, by = c("AREA_LONG_CODE"="xNeighbourhoodNumber"))
+
+neigh_compare_2020DF <- neigh_compare_2020 %>% st_drop_geometry()
+```
+
+I compared three groups of neighbourhoods based on amount of Bike Share coverage. The three groups were: 
+
+- Most Access (n=11)
+- Least Access (n=10) 
+- No Access (n=56)
+
+100% of the neighbourhoods with the most access are within walking distance of a Bike Share station. Less than 4% of the neighbourhoods with the least access are within walking distance. The neighbourhoods with no access do not have a Bike Share station. The sample sizes are small and unequal, so I used a nonparametric Kruskal-Wallace test to compare the three groups. There were significant differences between the groups for 7 of the 10 characteristics. 
+The boxplots below shows the distribution of the neighbourhood groups for each of the census characteristics. The black bar shows the mean for each group and the grey box is the interquartile range. You can see that neighbourhoods with the most access differ from one or both of the other neighbourhood groups for the following characteristics:
+
+- population density
+- prevalence of LICO
+- percent visible minority
+- percent over 65
+- percent working age
+- percent with a high school diploma or less
+- percent with post-secondary education
+
+
+```{r, results='hide',fig.keep='all', fig.align='center'}
+par(mfrow=c(2,5))
+
+map(c(6:ncol(neigh_compare_2020DF)), 
+    function(x){
+      boxplot(pull(neigh_compare_2020DF, x)~access, 
+              data=neigh_compare_2020DF, 
+              main=colnames(neigh_compare_2020DF[,x]), 
+              ylab = "")})
+```
+
+Post-hoc Nemenyi tests show that neighbourhoods with the most access are more densely populated and have a lower prevalence of low-income (as measured by LICO) than the other two groups. In neighbourhoods with no access to Bike Share, a significantly higher percent of their population identify as a visibility minority compared to neighbourhoods with the most access. But neighbourhoods with minimal access don’t differ from the other groups on this characteristic. Age differentiated neighbourhoods with the most access from neighbourhoods with no access.  The percent of the population that is working age is higher in neighbourhoods with the most access. The percent of the population  over age 65 is higher in neighbourhoods with no access. In terms of education, the neighbourhoods with the most access have higher percent of people with postsecondary education and lower percent with high school diploma or less compared to neighbourhoods with no access.
+
+```{r, warning=FALSE, error=FALSE}
+#Compare neighbourhoods with the most, least and no bike share station coverage across multiple socio-economic factors
+kwDF <-map_df(c(6:ncol(neigh_compare_2020DF)), 
+              function(x){
+                data.frame(var = colnames(neigh_compare_2020DF[,x]), 
+                           kwStat = kruskal.test(pull(neigh_compare_2020DF, x)~access, data=neigh_compare_2020DF)$statistic,
+                           kwDfree = kruskal.test(pull(neigh_compare_2020DF, x)~access, data=neigh_compare_2020DF)$parameter,
+                           kwPVal = kruskal.test(pull(neigh_compare_2020DF, x)~access, data=neigh_compare_2020DF)$p.value)}) %>% 
+  mutate(sig = kwPVal<0.05) #add a column to the dataframe indicating if significant at p =0.05
+
+kwDF 
+
+#post-hoc tests comparing the groups for the variables that were significant
+postHocDF <- map_df(c(6,7,9:13), function(x){data.frame(var = colnames(neigh_compare_2020DF[,x]), postHoc = posthoc.kruskal.nemenyi.test(pull(neigh_compare_2020DF,x)~as.factor(access), data=neigh_compare_2020DF, dist="Chisquare")$p.value)})
+
+postHocDF
+```
+```{r, eval=FALSE}
+#means across the different variables
+neigh_compare_2020DF[,c(4,6:ncol(neigh_compare_2020DF))] %>% 
+group_by(access) %>%
+summarise(across(everything(), mean))
+
+```
+
+## Conclusion
+Toronto’s bike share system has grown substantially over the last four years. The system has expanded into more neighbourhoods. And the concentration of stations in some neighbourhoods has increased as well. In nearly one-third of the city's neighbourhoods you can easily walk to a bike share station (i.e., neighbourhood coverage is > 50%). 
+
+There are social and educational disparities between those with and without access to the Bike Share system in Toronto. These differences are consistent with findings from other cities. Neighbourhoods with the best access are less diverse, younger, and more educated than those without access. In contrast to other research, there wasn't a clear pattern of disparity between neighbourhoods across the measures of income. There were significant differences between the neighbourhoods for only 1 of the 2 measures of poverty and there weren't any differences in the percent of the population with high incomes.  
+
+Overall, this analysis highlights a significant gap in equitable access to a low-cost and healthy for transportation in our city. The Bike Share system expansion is ongoing [5](https://www.toronto.ca/services-payments/streets-parking-transportation/cycling-in-toronto/cycle-track-projects/cycling-network-10-year-plan/). The city should consider equity in selecting new station locations. The city was successful with the downtown hub by expanding the system outward and growing stations on the periphery over time. The strategy for suburban communities may need to be different. The neighbourhoods with little or no access to the existing Bike Share network are more diverse and older than the neighbourhoods downtown. Bike Share Toronto should engage with those communities to select station locations and plan the roll-out in a way that meet the needs of those citizens. 
+
+## References
+1. Tse, J. (May 3, 2011). Bixi bike sharing officially launches in Toronto, BlogTO, accessed from: https://www.blogto.com/city/2011/05/bixi_bike-sharing_officially_launches_in_toronto/
+
+2. Kalinowski, T. (July 6, 2015). Bike Share Toronto to double with $4.9 million from Metrolinx, Toronto Star, accessed from: https://www.thestar.com/news/gta/transportation/2015/07/06/bike-share-toronto-to-double-with-49-million-from-metrolinx.html
+
+3. Bike Share Toronto. (January 2, 2020). 2019: A year of milestones for Bike Share Toronto, accessed from: https://bikesharetoronto.com/news/2019-milestones/
+
+4. City of Toronto. Cycling Network Plan, accessed on November 4, 2020 from: https://www.toronto.ca/services-payments/streets-parking-transportation/cycling-in-toronto/cycle-track-projects/cycling-network-10-year-plan/
+
+5. Toronto. City Council. Cycling Network Plan Update decision adopted on July 16, 17, and 18, 2019. Accessed from: http://app.toronto.ca/tmmis/viewAgendaItemHistory.do?item=2019.IE6.11
+
+6. Yang, Y. & Diez-Roux, A.V. (July 2012). Walking distance by trip purpose and population subgroups. American Journal of Preventive Medicine, 43(1), pp. 11-19. 
+
+7. Ursaki, J. & Aultman-Hall, L. (June 2015). Quantifying the equity of bike share access in US cities. (No. TRC Report 15-011). University of Vermont. Transportation Research Centre. 
+
+8. Su, T., & Wang, R. (February 7, 2019). Three ways bike share can counteract, not reinforce, DC's disparities. Blog of the Urban Institue, access from: https://www.urban.org/urban-wire/three-ways-bikeshare-can-counteract-not-reinforce-dcs-disparities.
+
+9. Krykewycz, G.R., et al. (December 2010). Defining a primary market and estimating demand for major bicycle-sharing progrma in Philadelphia, Pennsylvania. Transportation Research Record, 117-124.
+
+10. Toronto Cycling Think & Do Tank. Mapping Cylcing Behaviour in Toronto. Access on November 4, 2020 from: https://www.torontocycling.org/uploads/1/3/1/3/13138411/mapping_cycling_behaviour_in_toronto_final_23_may_printer_tl.pdf.
